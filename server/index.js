@@ -58,6 +58,45 @@ const imageMimeTypes = {
 };
 
 const isValidImageUrl = (value) => value == null || (typeof value === 'string' && value.length <= 512);
+const normalizeAccentColor = (value) => (
+  typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value.trim())
+    ? value.trim().toLowerCase()
+    : null
+);
+
+async function validateReviewGifUrl(value) {
+  if (value == null || value === '') return { valid: true, url: null };
+  if (typeof value !== 'string' || value.length > 512) return { valid: false, url: null };
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(value.trim(), 'http://musicfy.local');
+  } catch {
+    return { valid: false, url: null };
+  }
+
+  if (!['http:', 'https:'].includes(parsedUrl.protocol)) return { valid: false, url: null };
+  const imageAssetMatch = parsedUrl.pathname.match(/\/api\/images\/([a-f\d]{32})$/i);
+  if (imageAssetMatch) {
+    const asset = await getDb('SELECT mime_type FROM image_assets WHERE id = ?', [imageAssetMatch[1]]);
+    return { valid: asset?.mime_type === 'image/gif', url: value.trim() };
+  }
+
+  return { valid: /\.gif$/i.test(parsedUrl.pathname), url: value.trim() };
+}
+
+async function saveReviewGif(reviewId, gifUrl) {
+  if (!gifUrl) {
+    await runDb('DELETE FROM review_media WHERE review_id = ?', [reviewId]);
+    return;
+  }
+
+  await runDb(
+    `INSERT INTO review_media (review_id, gif_url) VALUES (?, ?)
+    ON DUPLICATE KEY UPDATE gif_url = VALUES(gif_url)`,
+    [reviewId, gifUrl]
+  );
+}
 
 const tidbPort = Number(process.env.TIDB_PORT || 4000);
 if (!Number.isInteger(tidbPort) || tidbPort < 1 || tidbPort > 65535) {
@@ -105,6 +144,91 @@ const getDb = async (sql, params = []) => {
 const allDb = async (sql, params = []) => {
   const [rows] = await db.execute(sql, params);
   return rows;
+};
+
+const attachReleaseArtists = async (releases) => {
+  if (!Array.isArray(releases) || !releases.length) return releases || [];
+  const releaseIds = [...new Set(releases.map((release) => Number(release.id)).filter(Number.isSafeInteger))];
+  if (!releaseIds.length) return releases;
+
+  const placeholders = releaseIds.map(() => '?').join(', ');
+  const rows = await allDb(`
+    SELECT ra.release_id, ra.sort_order, a.id, a.name, a.image_url
+    FROM release_artists ra
+    JOIN artists a ON a.id = ra.artist_id
+    WHERE ra.release_id IN (${placeholders})
+    ORDER BY ra.release_id ASC, ra.sort_order ASC, a.name ASC
+  `, releaseIds);
+
+  const artistsByRelease = new Map();
+  for (const row of rows) {
+    const artistList = artistsByRelease.get(row.release_id) || [];
+    artistList.push({ id: row.id, name: row.name, image_url: row.image_url });
+    artistsByRelease.set(row.release_id, artistList);
+  }
+
+  return releases.map((release) => ({
+    ...release,
+    featured_artists: artistsByRelease.get(release.id) || [],
+  }));
+};
+
+const saveReleaseArtists = async (releaseId, primaryArtistId, requestedArtistIds = []) => {
+  await runDb('DELETE FROM release_artists WHERE release_id = ?', [releaseId]);
+  if (!Array.isArray(requestedArtistIds)) return;
+
+  const uniqueIds = [...new Set(requestedArtistIds
+    .map((artistId) => Number(artistId))
+    .filter((artistId) => Number.isSafeInteger(artistId) && artistId > 0 && artistId !== Number(primaryArtistId)))];
+
+  for (const [index, artistId] of uniqueIds.entries()) {
+    const artist = await getDb('SELECT id FROM artists WHERE id = ?', [artistId]);
+    if (!artist) throw Object.assign(new Error('One of the featured artists does not exist.'), { statusCode: 400 });
+    await runDb(
+      'INSERT INTO release_artists (release_id, artist_id, sort_order) VALUES (?, ?, ?)',
+      [releaseId, artistId, index]
+    );
+  }
+};
+
+const createNotification = async (userId, type, message, linkUrl, actorUserId = null) => {
+  await runDb(
+    'INSERT INTO notifications (user_id, type, actor_user_id, message, link_url) VALUES (?, ?, ?, ?, ?)',
+    [userId, type, actorUserId, message, linkUrl]
+  );
+};
+
+const notifyReleaseAudience = async (releaseId, artistId, releaseTitle, artistName) => {
+  await runDb(`
+    INSERT INTO notifications (user_id, type, message, link_url)
+    SELECT audience.user_id, 'NEW_RELEASE', ?, ?
+    FROM (
+      SELECT user_id FROM pre_saves WHERE release_id = ?
+      UNION
+      SELECT user_id FROM artist_follows WHERE artist_id = ?
+    ) AS audience
+  `, [`Novo lançamento de ${artistName}: ${releaseTitle}.`, `/releases/${releaseId}`, releaseId, artistId]);
+};
+
+const publishDueReleases = async () => {
+  const dueReleases = await allDb(`
+    SELECT r.id, r.title, r.artist_id, a.name AS artist_name
+    FROM releases r
+    JOIN artists a ON a.id = r.artist_id
+    WHERE r.status = 'PREVIEW' AND r.release_date <= CURDATE()
+    ORDER BY r.release_date ASC, r.id ASC
+  `);
+
+  for (const release of dueReleases) {
+    const updated = await runDb(
+      `UPDATE releases SET status = 'ACTIVE', updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND status = 'PREVIEW' AND release_date <= CURDATE()`,
+      [release.id]
+    );
+    if (updated.changes) {
+      await notifyReleaseAudience(release.id, release.artist_id, release.title, release.artist_name);
+    }
+  }
 };
 
 const saveLegacyTrackContent = async (trackId, track) => {
@@ -160,6 +284,21 @@ const normalizeUser = (user) => {
     banner_url: user.banner_url,
     bio: user.bio,
     role: user.role || 'USER',
+    is_suspended: Boolean(Number(user.is_suspended)),
+    is_approved: Boolean(Number(user.is_approved)),
+    created_at: user.created_at,
+  };
+};
+
+const normalizePublicUser = (user) => {
+  if (!user) return null;
+  return {
+    id: user.id,
+    username: user.username,
+    full_name: user.full_name,
+    avatar_url: user.avatar_url,
+    banner_url: user.banner_url,
+    bio: user.bio,
     created_at: user.created_at,
   };
 };
@@ -174,7 +313,7 @@ const isFutureReleaseDate = (dateString) => {
 
 const sendToken = (user) => jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
 
-const requireAuth = (req, res, next) => {
+const requireAuth = async (req, res, next) => {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.substring(7) : null;
 
@@ -184,11 +323,81 @@ const requireAuth = (req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    next();
+    const userId = parsePositiveId(decoded.id);
+    if (!userId) return res.status(401).json({ error: 'Invalid or expired token.' });
+
+    const account = await getDb('SELECT id, `role`, is_suspended, is_approved FROM users WHERE id = ?', [userId]);
+    if (!account) return res.status(401).json({ error: 'Account no longer exists.' });
+    const isSuspended = Boolean(Number(account.is_suspended));
+    const notificationAccessAllowed = (
+      (req.method === 'GET' && req.path === '/api/notifications')
+      || (req.method === 'POST' && req.path === '/api/notifications/read-all')
+      || (req.method === 'POST' && /^\/api\/notifications\/\d+\/read$/.test(req.path))
+    );
+    const isApproved = Boolean(Number(account.is_approved));
+    if (isSuspended && !notificationAccessAllowed) {
+      return res.status(403).json({ error: 'Conta suspensa. Acesse apenas suas notificações.' });
+    }
+
+    req.user = {
+      ...decoded,
+      id: Number(account.id),
+      role: account.role,
+      is_suspended: isSuspended,
+      is_approved: isApproved,
+    };
+    const isReadOnlyMethod = ['GET', 'HEAD', 'OPTIONS'].includes(req.method);
+    if (!isApproved && !isReadOnlyMethod && !notificationAccessAllowed) {
+      return res.status(403).json({
+        error: 'Sua conta ainda aguarda aprovação da equipe administrativa. Enquanto isso, você pode apenas ler o conteúdo.',
+        code: 'ACCOUNT_PENDING_APPROVAL',
+      });
+    }
+    return next();
   } catch (error) {
-    return res.status(401).json({ error: 'Invalid or expired token.' });
+    if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Invalid or expired token.' });
+    }
+    return next(error);
   }
+};
+
+const optionalAuth = async (req, res, next) => {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.substring(7) : null;
+  if (!token) return next();
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const userId = parsePositiveId(decoded.id);
+    if (userId) {
+      const account = await getDb(
+        'SELECT id, `role`, is_suspended, is_approved FROM users WHERE id = ?',
+        [userId]
+      );
+      if (account) {
+        req.user = {
+          ...decoded,
+          id: Number(account.id),
+          role: account.role,
+          is_suspended: Boolean(Number(account.is_suspended)),
+          is_approved: Boolean(Number(account.is_approved)),
+        };
+      }
+    }
+  } catch (error) {
+    if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
+      req.user = null;
+    } else {
+      return next(error);
+    }
+  }
+  return next();
+};
+
+const parsePositiveId = (value) => {
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
 };
 
 const requireAdmin = (req, res, next) => {
@@ -198,8 +407,142 @@ const requireAdmin = (req, res, next) => {
   next();
 };
 
+let lastMusicBrainzRequestAt = 0;
+let musicBrainzQueue = Promise.resolve();
+
+const requestMusicBrainz = (url) => {
+  const request = musicBrainzQueue.then(async () => {
+    const wait = Math.max(0, 1000 - (Date.now() - lastMusicBrainzRequestAt));
+    if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+
+    lastMusicBrainzRequestAt = Date.now();
+    const response = await fetch(url, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'Musicfy/2.0.0 (https://github.com/joaolcs1212/MUSICFY-2.0-jl)',
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) throw new Error(`MusicBrainz responded with HTTP ${response.status}.`);
+    return response.json();
+  });
+
+  musicBrainzQueue = request.then(() => undefined, () => undefined);
+  return request;
+};
+
+const musicBrainzQuerySpecialCharacters = '+-!(){}[]^"~*?:\\/&|';
+const escapeMusicBrainzQuery = (value) => Array.from(value, (character) => (
+  musicBrainzQuerySpecialCharacters.includes(character) ? `\\${character}` : character
+)).join('');
+
+const musicBrainzGenreNames = (entity) => (
+  [...(entity.genres || []), ...(entity.tags || [])]
+    .map((tag) => typeof tag === 'string' ? tag : tag?.name)
+    .filter(Boolean)
+    .map((name) => name.trim())
+    .filter((name, index, names) => names.findIndex((item) => item.toLocaleLowerCase() === name.toLocaleLowerCase()) === index)
+    .slice(0, 8)
+);
+
+const formatMusicBrainzDuration = (milliseconds) => {
+  const seconds = Math.round(Number(milliseconds) / 1000);
+  if (!Number.isFinite(seconds) || seconds < 0) return '';
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+};
+
 async function initializeDatabase() {
   await execDb(fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8'));
+
+  const accentColumns = [
+    ['artists', 'accent_color'],
+    ['releases', 'accent_color'],
+  ];
+  for (const [tableName, columnName] of accentColumns) {
+    const column = await getDb(`
+      SELECT COLUMN_NAME
+      FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
+    `, [tableName, columnName]);
+    if (!column) {
+      await execDb(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} VARCHAR(7) NULL`);
+    }
+  }
+
+  const playlistSortOrderColumn = await getDb(`
+    SELECT COLUMN_NAME
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'playlist_tracks' AND COLUMN_NAME = 'sort_order'
+  `);
+  if (!playlistSortOrderColumn) {
+    await execDb('ALTER TABLE playlist_tracks ADD COLUMN sort_order INT UNSIGNED NOT NULL DEFAULT 0');
+  }
+
+  await execDb('DROP TABLE IF EXISTS email_verification_tokens');
+  const emailVerifiedColumn = await getDb(`
+    SELECT COLUMN_NAME
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'email_verified'
+  `);
+  if (emailVerifiedColumn) {
+    await execDb('ALTER TABLE users DROP COLUMN email_verified');
+  }
+
+  const featuredBannerColumn = await getDb(`
+    SELECT COLUMN_NAME
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'featured_releases' AND COLUMN_NAME = 'banner_url'
+  `);
+  if (!featuredBannerColumn) {
+    await execDb('ALTER TABLE featured_releases ADD COLUMN banner_url VARCHAR(512) NULL');
+  }
+
+  const featuredDescriptionColumn = await getDb(`
+    SELECT COLUMN_NAME
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'featured_releases' AND COLUMN_NAME = 'description'
+  `);
+  if (!featuredDescriptionColumn) {
+    await execDb('ALTER TABLE featured_releases ADD COLUMN description TEXT NULL');
+  }
+
+  const suspendedColumn = await getDb(`
+    SELECT COLUMN_NAME
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'is_suspended'
+  `);
+  if (!suspendedColumn) {
+    await execDb('ALTER TABLE users ADD COLUMN is_suspended TINYINT(1) NOT NULL DEFAULT 0');
+  }
+
+  const approvalColumn = await getDb(`
+    SELECT COLUMN_NAME
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'is_approved'
+  `);
+  if (!approvalColumn) {
+    await execDb('ALTER TABLE users ADD COLUMN is_approved TINYINT(1) NOT NULL DEFAULT 1');
+  }
+
+  await runDb(
+    `INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('require_profile_approval', '1')`
+  );
+
+  const notificationColumns = [
+    ['type', "VARCHAR(32) NOT NULL DEFAULT 'GENERAL'"],
+    ['actor_user_id', 'BIGINT UNSIGNED NULL'],
+    ['link_url', 'VARCHAR(512) NULL'],
+  ];
+  for (const [columnName, columnDefinition] of notificationColumns) {
+    const column = await getDb(`
+      SELECT COLUMN_NAME
+      FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'notifications' AND COLUMN_NAME = ?
+    `, [columnName]);
+    if (!column) {
+      await execDb(`ALTER TABLE notifications ADD COLUMN \`${columnName}\` ${columnDefinition}`);
+    }
+  }
 
   const rolesRow = await getDb('SELECT COUNT(*) AS count FROM roles');
   if (Number(rolesRow?.count || 0) === 0) {
@@ -545,36 +888,97 @@ app.get('/api/images/:id', async (req, res) => {
   return res.send(image.image_data);
 });
 
+app.get('/api/auth/registration-settings', async (req, res) => {
+  const setting = await getDb(
+    'SELECT setting_value FROM app_settings WHERE setting_key = ?',
+    ['require_profile_approval']
+  );
+  if (!setting) {
+    return res.status(503).json({ error: 'Registration settings are unavailable.' });
+  }
+  return res.json({ approval_required: setting.setting_value === '1' });
+});
+
 app.post('/api/auth/register', async (req, res) => {
+  let connection;
+  let transactionStarted = false;
   try {
-    const { username, full_name, email, password, confirmPassword } = req.body;
+    const {
+      username: submittedUsername,
+      full_name: submittedName,
+      email: submittedEmail,
+      password,
+      confirmPassword,
+    } = req.body;
+    const username = typeof submittedUsername === 'string' ? submittedUsername.trim() : '';
+    const full_name = typeof submittedName === 'string' ? submittedName.trim() : '';
+    const email = typeof submittedEmail === 'string' ? submittedEmail.trim().toLowerCase() : '';
     if (!username || !full_name || !email || !password) {
-      return res.status(400).json({ error: 'All fields are required.' });
+      return res.status(400).json({ error: 'Nome, nome de usuário, e-mail e senha são obrigatórios.' });
     }
     if (password !== confirmPassword) {
-      return res.status(400).json({ error: 'Passwords do not match.' });
+      return res.status(400).json({ error: 'As senhas não correspondem.' });
     }
     if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
-    }
-
-    const existing = await getDb('SELECT id FROM users WHERE username = ? OR email = ?', [username, email]);
-    if (existing) {
-      return res.status(409).json({ error: 'Username or email already in use.' });
+      return res.status(400).json({ error: 'A senha deve ter pelo menos 6 caracteres.' });
     }
 
     const passwordHash = bcrypt.hashSync(password, 10);
-    const result = await runDb(
-      `INSERT INTO users (username, full_name, email, password_hash, avatar_url, bio, \`role\`) VALUES (?, ?, ?, ?, ?, ?, 'USER')`,
-      [username, full_name, email, passwordHash, 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=800&q=80', 'New to Musicfy.']
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    transactionStarted = true;
+    const [settingRows] = await connection.execute(
+      'SELECT setting_value FROM app_settings WHERE setting_key = ? FOR UPDATE',
+      ['require_profile_approval']
     );
+    if (!settingRows[0]) {
+      throw new Error('Registration approval setting is missing.');
+    }
 
-    const user = await getDb('SELECT * FROM users WHERE id = ?', [result.id]);
+    const approvalRequired = settingRows[0].setting_value === '1';
+    const [existingUsers] = await connection.execute(
+      'SELECT id FROM users WHERE username = ? OR email = ? LIMIT 1',
+      [username, email]
+    );
+    if (existingUsers.length) {
+      await connection.rollback();
+      transactionStarted = false;
+      return res.status(409).json({ error: 'Este nome de usuário ou e-mail já está cadastrado.' });
+    }
+
+    const [result] = await connection.execute(
+      `INSERT INTO users (username, full_name, email, password_hash, avatar_url, bio, \`role\`, is_approved) VALUES (?, ?, ?, ?, ?, ?, 'USER', ?)`,
+      [
+        username,
+        full_name,
+        email,
+        passwordHash,
+        'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=800&q=80',
+        'New to Musicfy.',
+        approvalRequired ? 0 : 1,
+      ]
+    );
+    const [userRows] = await connection.execute('SELECT * FROM users WHERE id = ?', [result.insertId]);
+    await connection.commit();
+    transactionStarted = false;
+    const user = userRows[0];
     const token = sendToken(user);
     return res.status(201).json({ token, user: normalizeUser(user) });
   } catch (error) {
+    if (transactionStarted) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error('Failed to roll back account registration:', rollbackError);
+      }
+    }
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: 'Este nome de usuário ou e-mail já está cadastrado.' });
+    }
     console.error(error);
     return res.status(500).json({ error: 'Registration failed.' });
+  } finally {
+    connection?.release();
   }
 });
 
@@ -631,22 +1035,170 @@ app.get('/api/artists/:id', async (req, res) => {
     FROM releases r
     JOIN artists a ON a.id = r.artist_id
     WHERE r.artist_id = ?
+      OR EXISTS (SELECT 1 FROM release_artists ra WHERE ra.release_id = r.id AND ra.artist_id = ?)
     ORDER BY r.release_date DESC
-  `, [req.params.id]);
+  `, [req.params.id, req.params.id]);
 
-  return res.json({ artist, genres: genres.map((g) => g.name), releases });
+  return res.json({ artist, genres: genres.map((g) => g.name), releases: await attachReleaseArtists(releases) });
+});
+
+app.get('/api/artists/:id/follow', requireAuth, async (req, res) => {
+  const artistId = parsePositiveId(req.params.id);
+  if (!artistId) return res.status(400).json({ error: 'Invalid artist ID.' });
+
+  const artist = await getDb('SELECT id FROM artists WHERE id = ?', [artistId]);
+  if (!artist) return res.status(404).json({ error: 'Artist not found.' });
+
+  const followState = await getDb(`
+    SELECT
+      EXISTS (SELECT 1 FROM artist_follows WHERE user_id = ? AND artist_id = ?) AS following,
+      (SELECT COUNT(*) FROM artist_follows WHERE artist_id = ?) AS follower_count
+  `, [req.user.id, artistId, artistId]);
+  return res.json({
+    following: Boolean(followState.following),
+    follower_count: Number(followState.follower_count || 0),
+  });
+});
+
+app.post('/api/artists/:id/follow', requireAuth, async (req, res) => {
+  const artistId = parsePositiveId(req.params.id);
+  if (!artistId) return res.status(400).json({ error: 'Invalid artist ID.' });
+
+  const artist = await getDb('SELECT id FROM artists WHERE id = ?', [artistId]);
+  if (!artist) return res.status(404).json({ error: 'Artist not found.' });
+
+  await runDb('INSERT IGNORE INTO artist_follows (user_id, artist_id) VALUES (?, ?)', [req.user.id, artistId]);
+  const count = await getDb('SELECT COUNT(*) AS follower_count FROM artist_follows WHERE artist_id = ?', [artistId]);
+  return res.json({ following: true, follower_count: Number(count.follower_count || 0) });
+});
+
+app.delete('/api/artists/:id/follow', requireAuth, async (req, res) => {
+  const artistId = parsePositiveId(req.params.id);
+  if (!artistId) return res.status(400).json({ error: 'Invalid artist ID.' });
+
+  const artist = await getDb('SELECT id FROM artists WHERE id = ?', [artistId]);
+  if (!artist) return res.status(404).json({ error: 'Artist not found.' });
+
+  await runDb('DELETE FROM artist_follows WHERE user_id = ? AND artist_id = ?', [req.user.id, artistId]);
+  const count = await getDb('SELECT COUNT(*) AS follower_count FROM artist_follows WHERE artist_id = ?', [artistId]);
+  return res.json({ following: false, follower_count: Number(count.follower_count || 0) });
+});
+
+app.get('/api/admin/musicbrainz/artists', requireAuth, requireAdmin, async (req, res) => {
+  const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  if (!query || query.length > 100) {
+    return res.status(400).json({ error: 'Informe um nome de artista com até 100 caracteres.' });
+  }
+
+  const params = new URLSearchParams({
+    query: `artist:"${escapeMusicBrainzQuery(query)}"`,
+    fmt: 'json',
+    limit: '10',
+  });
+
+  try {
+    const data = await requestMusicBrainz(`https://musicbrainz.org/ws/2/artist/?${params}`);
+    return res.json((data.artists || []).map((artist) => ({
+      id: artist.id,
+      name: artist.name,
+      disambiguation: artist.disambiguation || '',
+      country: artist.country || '',
+      type: artist.type || '',
+      genres: musicBrainzGenreNames(artist),
+    })));
+  } catch (error) {
+    console.error('MusicBrainz artist search failed:', error.message);
+    return res.status(502).json({ error: 'Não foi possível consultar o MusicBrainz agora. Tente novamente.' });
+  }
+});
+
+app.get('/api/admin/musicbrainz/releases', requireAuth, requireAdmin, async (req, res) => {
+  const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const artist = typeof req.query.artist === 'string' ? req.query.artist.trim() : '';
+  if (!query || query.length > 100 || !artist || artist.length > 100) {
+    return res.status(400).json({ error: 'Informe o título e o artista, com até 100 caracteres cada.' });
+  }
+
+  const params = new URLSearchParams({
+    query: `artist:"${escapeMusicBrainzQuery(artist)}" AND releasegroup:"${escapeMusicBrainzQuery(query)}"`,
+    fmt: 'json',
+    limit: '10',
+  });
+
+  try {
+    const data = await requestMusicBrainz(`https://musicbrainz.org/ws/2/release-group/?${params}`);
+    return res.json((data['release-groups'] || []).map((release) => ({
+      id: release.id,
+      title: release.title,
+      artist: (release['artist-credit'] || [])
+        .map((credit) => `${credit.name || credit.artist?.name || ''}${credit.joinphrase || ''}`)
+        .join(''),
+      date: release['first-release-date'] || '',
+      type: release['primary-type'] || '',
+      genres: musicBrainzGenreNames(release),
+    })));
+  } catch (error) {
+    console.error('MusicBrainz release search failed:', error.message);
+    return res.status(502).json({ error: 'Não foi possível consultar o MusicBrainz agora. Tente novamente.' });
+  }
+});
+
+app.get('/api/admin/musicbrainz/releases/:id', requireAuth, requireAdmin, async (req, res) => {
+  if (!/^[a-f\d]{8}-(?:[a-f\d]{4}-){3}[a-f\d]{12}$/i.test(req.params.id)) {
+    return res.status(400).json({ error: 'Identificador de lançamento inválido.' });
+  }
+
+  const params = new URLSearchParams({
+    'release-group': req.params.id,
+    inc: 'recordings',
+    fmt: 'json',
+    limit: '100',
+  });
+
+  try {
+    const data = await requestMusicBrainz(`https://musicbrainz.org/ws/2/release/?${params}`);
+    const releases = data.releases || [];
+    releases.sort((first, second) => {
+      const firstDate = first.date || '9999';
+      const secondDate = second.date || '9999';
+      if (firstDate !== secondDate) return firstDate.localeCompare(secondDate);
+      const firstTrackCount = (first.media || []).reduce((count, medium) => count + (medium.tracks || []).length, 0);
+      const secondTrackCount = (second.media || []).reduce((count, medium) => count + (medium.tracks || []).length, 0);
+      return secondTrackCount - firstTrackCount;
+    });
+
+    const selectedRelease = releases.find((release) => (
+      (release.media || []).some((medium) => (medium.tracks || []).length)
+    ));
+    const releaseDate = /^\d{4}-\d{2}-\d{2}$/.test(selectedRelease?.date || '') ? selectedRelease.date : '';
+    const tracks = (selectedRelease?.media || []).flatMap((medium) => (
+      (medium.tracks || []).map((track) => ({
+        title: track.title || track.recording?.title || '',
+        duration: formatMusicBrainzDuration(track.length || track.recording?.length),
+      }))
+    ));
+
+    return res.json({
+      tracks,
+      release_date: releaseDate,
+      cover_url: `https://coverartarchive.org/release-group/${req.params.id}/front-500`,
+    });
+  } catch (error) {
+    console.error('MusicBrainz release details lookup failed:', error.message);
+    return res.status(502).json({ error: 'Não foi possível carregar as faixas no MusicBrainz agora. Tente novamente.' });
+  }
 });
 
 app.post('/api/artists', requireAuth, requireAdmin, async (req, res) => {
-  const { name, bio, image_url, banner_url, genres = [] } = req.body;
+  const { name, bio, image_url, banner_url, genres = [], accent_color } = req.body;
   if (!name) return res.status(400).json({ error: 'Artist name is required.' });
   if (!isValidImageUrl(image_url) || !isValidImageUrl(banner_url)) {
     return res.status(400).json({ error: 'Use a valid image URL with at most 512 characters, or upload an image file.' });
   }
 
   const artist = await runDb(
-    `INSERT INTO artists (name, bio, image_url, banner_url, genre) VALUES (?, ?, ?, ?, ?)`,
-    [name, bio || '', image_url || '', banner_url || '', genres[0] || '']
+    `INSERT INTO artists (name, bio, image_url, banner_url, genre, accent_color) VALUES (?, ?, ?, ?, ?, ?)`,
+    [name, bio || '', image_url || '', banner_url || '', genres[0] || '', normalizeAccentColor(accent_color)]
   );
 
   for (const genreName of genres) {
@@ -661,7 +1213,7 @@ app.post('/api/artists', requireAuth, requireAdmin, async (req, res) => {
 
 app.put('/api/artists/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
-  const { name, bio, image_url, banner_url, genres = [] } = req.body;
+  const { name, bio, image_url, banner_url, genres = [], accent_color } = req.body;
 
   const existingArtist = await getDb('SELECT id FROM artists WHERE id = ?', [id]);
   if (!existingArtist) return res.status(404).json({ error: 'Artist not found.' });
@@ -671,8 +1223,8 @@ app.put('/api/artists/:id', requireAuth, requireAdmin, async (req, res) => {
   }
 
   await runDb(
-    `UPDATE artists SET name = ?, bio = ?, image_url = ?, banner_url = ?, genre = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [name, bio || '', image_url || '', banner_url || '', genres[0] || '', id]
+    `UPDATE artists SET name = ?, bio = ?, image_url = ?, banner_url = ?, genre = ?, accent_color = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    [name, bio || '', image_url || '', banner_url || '', genres[0] || '', normalizeAccentColor(accent_color), id]
   );
 
   await runDb('DELETE FROM artist_genres WHERE artist_id = ?', [id]);
@@ -720,14 +1272,16 @@ app.get('/api/releases', async (req, res) => {
     FROM releases r
     JOIN artists a ON a.id = r.artist_id
     LEFT JOIN (
-      SELECT release_id, ROUND(AVG(rating), 1) AS avg_rating, COUNT(*) AS review_count
-      FROM reviews
+      SELECT rv.release_id, ROUND(AVG(rv.rating), 1) AS avg_rating, COUNT(*) AS review_count
+      FROM reviews rv
+      JOIN users u ON u.id = rv.user_id
+      WHERE u.is_suspended = 0
       GROUP BY release_id
     ) rv ON rv.release_id = r.id
     ORDER BY r.release_date DESC
   `);
 
-  return res.json(rows);
+  return res.json(await attachReleaseArtists(rows));
 });
 
 app.get('/api/releases/:id', async (req, res) => {
@@ -737,14 +1291,18 @@ app.get('/api/releases/:id', async (req, res) => {
     FROM releases r
     JOIN artists a ON a.id = r.artist_id
     LEFT JOIN (
-      SELECT release_id, ROUND(AVG(rating), 1) AS avg_rating, COUNT(*) AS review_count
-      FROM reviews
+      SELECT rv.release_id, ROUND(AVG(rv.rating), 1) AS avg_rating, COUNT(*) AS review_count
+      FROM reviews rv
+      JOIN users u ON u.id = rv.user_id
+      WHERE u.is_suspended = 0
       GROUP BY release_id
     ) rv ON rv.release_id = r.id
     WHERE r.id = ?
   `, [req.params.id]);
 
   if (!release) return res.status(404).json({ error: 'Release not found.' });
+  const [releaseWithArtists] = await attachReleaseArtists([release]);
+  const resultRelease = releaseWithArtists;
 
   let currentUserId = null;
   const authHeader = req.headers.authorization || '';
@@ -782,18 +1340,20 @@ app.get('/api/releases/:id', async (req, res) => {
     links: trackLinks.filter((link) => link.track_id === track.id),
   }));
   const reviews = await allDb(`
-    SELECT rv.*, u.username, u.avatar_url,
+    SELECT rv.*, rm.gif_url, u.username, u.avatar_url,
       (SELECT COUNT(*) FROM review_likes rl WHERE rl.review_id = rv.id) AS like_count,
       EXISTS (
         SELECT 1 FROM review_likes rl WHERE rl.review_id = rv.id AND rl.user_id = ?
       ) AS liked_by_user
     FROM reviews rv
+    LEFT JOIN review_media rm ON rm.review_id = rv.id
     JOIN users u ON u.id = rv.user_id
     WHERE rv.release_id = ?
+      AND u.is_suspended = 0
     ORDER BY rv.created_at DESC
   `, [currentUserId || 0, req.params.id]);
 
-  return res.json({ release, tracks: enrichedTracks, reviews });
+  return res.json({ release: resultRelease, tracks: enrichedTracks, reviews });
 });
 
 app.post('/api/releases', requireAuth, requireAdmin, async (req, res) => {
@@ -806,7 +1366,9 @@ app.post('/api/releases', requireAuth, requireAdmin, async (req, res) => {
     release_date,
     genre,
     description,
+    accent_color,
     tracks = [],
+    featured_artist_ids = [],
   } = req.body;
 
   if (!title || !release_type || !release_date) {
@@ -844,29 +1406,34 @@ app.post('/api/releases', requireAuth, requireAdmin, async (req, res) => {
   if (!resolvedArtistId) {
     return res.status(400).json({ error: 'Selecione um artista ou informe o nome do artista.' });
   }
+  if (!Array.isArray(featured_artist_ids)) {
+    return res.status(400).json({ error: 'Os feats devem ser enviados como uma lista de artistas.' });
+  }
+  for (const featuredArtistId of featured_artist_ids) {
+    const requestedId = Number(featuredArtistId);
+    if (!Number.isSafeInteger(requestedId) || requestedId < 1) {
+      return res.status(400).json({ error: 'Selecione apenas artistas válidos como feats.' });
+    }
+  }
 
   const isFuture = isFutureReleaseDate(release_date);
   const release = await runDb(
-    `INSERT INTO releases (title, artist_id, cover_url, release_type, release_date, genre, description, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [title, resolvedArtistId, cover_url || '', release_type, release_date, genre || '', description || '', isFuture ? 'PREVIEW' : 'ACTIVE']
+    `INSERT INTO releases (title, artist_id, cover_url, release_type, release_date, genre, description, status, accent_color) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [title, resolvedArtistId, cover_url || '', release_type, release_date, genre || '', description || '', isFuture ? 'PREVIEW' : 'ACTIVE', normalizeAccentColor(accent_color)]
   );
+  await saveReleaseArtists(release.id, resolvedArtistId, featured_artist_ids);
 
   for (const [index, track] of tracks.entries()) {
     const createdTrack = await runDb(
       `INSERT INTO tracks (release_id, title, duration, explicit, youtube_url, lyrics, translation, track_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [release.id, track.title || `Faixa ${index + 1}`, track.duration || '3:00', track.explicit ? 1 : 0, track.youtube_url || '', track.lyrics || '', track.translation || '', index + 1]
+      [release.id, track.title || `Faixa ${index + 1}`, track.duration || null, track.explicit ? 1 : 0, track.youtube_url || '', track.lyrics || '', track.translation || '', index + 1]
     );
     await saveLegacyTrackContent(createdTrack.id, track);
   }
 
   if (!isFuture) {
-    const preSaves = await allDb('SELECT user_id FROM pre_saves WHERE release_id = ?', [release.id]);
-    for (const saved of preSaves) {
-      const notification = await getDb('SELECT id FROM notifications WHERE user_id = ? AND message = ?', [saved.user_id, `${title} foi lançado.`]);
-      if (!notification) {
-        await runDb('INSERT INTO notifications (user_id, message, read_status) VALUES (?, ?, 0)', [saved.user_id, `${title} foi lançado.`]);
-      }
-    }
+    const artist = await getDb('SELECT name FROM artists WHERE id = ?', [resolvedArtistId]);
+    await notifyReleaseAudience(release.id, resolvedArtistId, title, artist.name);
   }
 
   return res.status(201).json({ message: 'Release created.', releaseId: release.id, status: isFuture ? 'PREVIEW' : 'ACTIVE' });
@@ -874,13 +1441,16 @@ app.post('/api/releases', requireAuth, requireAdmin, async (req, res) => {
 
 app.put('/api/releases/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
-  const { title, artist_id, artist_name, cover_url, release_type, release_date, genre, description, tracks = [] } = req.body;
+  const { title, artist_id, artist_name, cover_url, release_type, release_date, genre, description, accent_color, tracks = [], featured_artist_ids = [] } = req.body;
 
   const existingRelease = await getDb('SELECT * FROM releases WHERE id = ?', [id]);
   if (!existingRelease) return res.status(404).json({ error: 'Release not found.' });
   if (!Array.isArray(tracks)) return res.status(400).json({ error: 'Tracks must be an array.' });
   if (!isValidImageUrl(cover_url)) {
     return res.status(400).json({ error: 'Use uma URL de capa com até 512 caracteres ou carregue um arquivo de imagem.' });
+  }
+  if (!Array.isArray(featured_artist_ids)) {
+    return res.status(400).json({ error: 'Os feats devem ser enviados como uma lista de artistas.' });
   }
 
   const existingTracks = await allDb('SELECT id FROM tracks WHERE release_id = ? ORDER BY track_number ASC, id ASC', [id]);
@@ -937,15 +1507,22 @@ app.put('/api/releases/:id', requireAuth, requireAdmin, async (req, res) => {
   if (!resolvedArtistId) {
     return res.status(400).json({ error: 'Selecione um artista cadastrado no catálogo.' });
   }
+  for (const featuredArtistId of featured_artist_ids) {
+    const requestedId = Number(featuredArtistId);
+    if (!Number.isSafeInteger(requestedId) || requestedId < 1) {
+      return res.status(400).json({ error: 'Selecione apenas artistas válidos como feats.' });
+    }
+  }
 
   const isFuture = isFutureReleaseDate(release_date || existingRelease.release_date);
   await runDb(
-    `UPDATE releases SET title = ?, artist_id = ?, cover_url = ?, release_type = ?, release_date = ?, genre = ?, description = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [title || existingRelease.title, resolvedArtistId, cover_url || existingRelease.cover_url, release_type || existingRelease.release_type, release_date || existingRelease.release_date, genre || existingRelease.genre, description || existingRelease.description, isFuture ? 'PREVIEW' : 'ACTIVE', id]
+    `UPDATE releases SET title = ?, artist_id = ?, cover_url = ?, release_type = ?, release_date = ?, genre = ?, description = ?, status = ?, accent_color = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    [title || existingRelease.title, resolvedArtistId, cover_url || existingRelease.cover_url, release_type || existingRelease.release_type, release_date || existingRelease.release_date, genre || existingRelease.genre, description || existingRelease.description, isFuture ? 'PREVIEW' : 'ACTIVE', normalizeAccentColor(accent_color), id]
   );
+  await saveReleaseArtists(id, resolvedArtistId, featured_artist_ids);
 
   for (const [index, track] of tracks.entries()) {
-    const values = [track.title || `Faixa ${index + 1}`, track.duration || '3:00', track.explicit ? 1 : 0, track.youtube_url || '', track.lyrics || '', track.translation || '', index + 1];
+    const values = [track.title || `Faixa ${index + 1}`, track.duration || null, track.explicit ? 1 : 0, track.youtube_url || '', track.lyrics || '', track.translation || '', index + 1];
     let trackId = trackAssignments[index];
     if (trackId != null) {
       await runDb(
@@ -975,6 +1552,11 @@ app.put('/api/releases/:id', requireAuth, requireAdmin, async (req, res) => {
     await runDb(`DELETE FROM tracks WHERE id IN (${placeholders})`, removedTrackIds);
   }
 
+  if (existingRelease.status !== 'ACTIVE' && !isFuture) {
+    const artist = await getDb('SELECT name FROM artists WHERE id = ?', [resolvedArtistId]);
+    await notifyReleaseAudience(id, resolvedArtistId, title || existingRelease.title, artist.name);
+  }
+
   return res.json({ message: 'Release updated.' });
 });
 
@@ -1002,51 +1584,133 @@ app.delete('/api/releases/:id', requireAuth, requireAdmin, async (req, res) => {
 });
 
 app.post('/api/reviews', requireAuth, async (req, res) => {
-  const { release_id, rating, review_text } = req.body;
-  if (!release_id || !rating) {
-    return res.status(400).json({ error: 'Release and rating are required.' });
+  const { release_id, rating, review_text, gif_url } = req.body;
+  const releaseId = parsePositiveId(release_id);
+  const parsedRating = Number(rating);
+  if (!releaseId || !Number.isInteger(parsedRating) || parsedRating < 0 || parsedRating > 10) {
+    return res.status(400).json({ error: 'Release and a rating from 0 to 10 are required.' });
+  }
+  if (review_text != null && typeof review_text !== 'string') {
+    return res.status(400).json({ error: 'Review text must be a string.' });
+  }
+  const reviewText = review_text || '';
+  if (reviewText.length > 300) {
+    return res.status(400).json({ error: 'Reviews can contain at most 300 characters.' });
   }
 
-  const existing = await getDb('SELECT id FROM reviews WHERE user_id = ? AND release_id = ?', [req.user.id, release_id]);
+  const hasGifUrl = Object.prototype.hasOwnProperty.call(req.body, 'gif_url');
+  const reviewGif = hasGifUrl ? await validateReviewGifUrl(gif_url) : { valid: true, url: null };
+  if (!reviewGif.valid) {
+    return res.status(400).json({ error: 'Attach a valid GIF URL or upload a GIF file.' });
+  }
+
+  const existing = await getDb('SELECT id FROM reviews WHERE user_id = ? AND release_id = ?', [req.user.id, releaseId]);
   if (existing) {
-    await runDb(`UPDATE reviews SET rating = ?, review_text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [rating, review_text || '', existing.id]);
+    await runDb(`UPDATE reviews SET rating = ?, review_text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [parsedRating, reviewText, existing.id]);
+    if (hasGifUrl) await saveReviewGif(existing.id, reviewGif.url);
     return res.json({ message: 'Review updated.', reviewId: existing.id });
   }
 
   const review = await runDb(
     `INSERT INTO reviews (user_id, release_id, rating, review_text) VALUES (?, ?, ?, ?)`,
-    [req.user.id, release_id, rating, review_text || '']
+    [req.user.id, releaseId, parsedRating, reviewText]
   );
+  if (hasGifUrl) await saveReviewGif(review.id, reviewGif.url);
 
   return res.status(201).json({ message: 'Review created.', reviewId: review.id });
 });
 
 app.put('/api/reviews/:id', requireAuth, async (req, res) => {
-  const review = await getDb('SELECT * FROM reviews WHERE id = ?', [req.params.id]);
+  const reviewId = parsePositiveId(req.params.id);
+  if (!reviewId) return res.status(400).json({ error: 'Review ID is invalid.' });
+
+  const review = await getDb('SELECT * FROM reviews WHERE id = ?', [reviewId]);
   if (!review) return res.status(404).json({ error: 'Review not found.' });
-  if (review.user_id !== req.user.id && req.user.role !== 'ADMIN') {
+  if (Number(review.user_id) !== Number(req.user.id) && req.user.role !== 'ADMIN') {
     return res.status(403).json({ error: 'You can only update your own review.' });
   }
 
-  const { rating, review_text } = req.body;
-  await runDb(`UPDATE reviews SET rating = ?, review_text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [rating, review_text || '', req.params.id]);
+  const { rating, review_text, gif_url } = req.body;
+  const parsedRating = Number(rating);
+  if (!Number.isInteger(parsedRating) || parsedRating < 0 || parsedRating > 10) {
+    return res.status(400).json({ error: 'Rating must be a number from 0 to 10.' });
+  }
+  if (review_text != null && typeof review_text !== 'string') {
+    return res.status(400).json({ error: 'Review text must be a string.' });
+  }
+  const reviewText = review_text || '';
+  if (reviewText.length > 300) {
+    return res.status(400).json({ error: 'Reviews can contain at most 300 characters.' });
+  }
+
+  const hasGifUrl = Object.prototype.hasOwnProperty.call(req.body, 'gif_url');
+  const reviewGif = hasGifUrl ? await validateReviewGifUrl(gif_url) : { valid: true, url: null };
+  if (!reviewGif.valid) {
+    return res.status(400).json({ error: 'Attach a valid GIF URL or upload a GIF file.' });
+  }
+
+  await runDb(`UPDATE reviews SET rating = ?, review_text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [parsedRating, reviewText, reviewId]);
+  if (hasGifUrl) await saveReviewGif(reviewId, reviewGif.url);
   return res.json({ message: 'Review updated.' });
 });
 
 app.delete('/api/reviews/:id', requireAuth, async (req, res) => {
-  const review = await getDb('SELECT * FROM reviews WHERE id = ?', [req.params.id]);
+  const reviewId = parsePositiveId(req.params.id);
+  if (!reviewId) return res.status(400).json({ error: 'Review ID is invalid.' });
+
+  const review = await getDb(`
+    SELECT rv.id, rv.user_id, rv.release_id, r.title AS release_title
+    FROM reviews rv
+    JOIN releases r ON r.id = rv.release_id
+    WHERE rv.id = ?
+  `, [reviewId]);
   if (!review) return res.status(404).json({ error: 'Review not found.' });
-  if (review.user_id !== req.user.id && req.user.role !== 'ADMIN') {
+  if (Number(review.user_id) !== Number(req.user.id) && req.user.role !== 'ADMIN') {
     return res.status(403).json({ error: 'You can only delete your own review.' });
   }
 
-  await runDb('DELETE FROM review_likes WHERE review_id = ?', [req.params.id]);
-  await runDb('DELETE FROM reviews WHERE id = ?', [req.params.id]);
+  if (req.user.role === 'ADMIN' && Number(review.user_id) !== Number(req.user.id)) {
+    const connection = await db.getConnection();
+    try {
+      await connection.beginTransaction();
+      await connection.execute('DELETE FROM review_likes WHERE review_id = ?', [reviewId]);
+      await connection.execute('DELETE FROM reviews WHERE id = ?', [reviewId]);
+      await connection.execute(
+        'INSERT INTO notifications (user_id, type, actor_user_id, message, link_url) VALUES (?, ?, ?, ?, ?)',
+        [
+          review.user_id,
+          'REVIEW_REMOVED',
+          req.user.id,
+          `Um administrador removeu sua resenha de ${review.release_title}.`,
+          `/releases/${review.release_id}`,
+        ]
+      );
+      await connection.commit();
+    } catch (error) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error('Failed to roll back admin review removal:', rollbackError);
+      }
+      throw error;
+    } finally {
+      connection.release();
+    }
+    return res.json({ message: 'Review deleted and its author notified.' });
+  }
+
+  await runDb('DELETE FROM review_likes WHERE review_id = ?', [reviewId]);
+  await runDb('DELETE FROM reviews WHERE id = ?', [reviewId]);
   return res.json({ message: 'Review deleted.' });
 });
 
 app.post('/api/reviews/:id/like', requireAuth, async (req, res) => {
-  const review = await getDb('SELECT * FROM reviews WHERE id = ?', [req.params.id]);
+  const review = await getDb(`
+    SELECT rv.*, r.title AS release_title
+    FROM reviews rv
+    JOIN releases r ON r.id = rv.release_id
+    WHERE rv.id = ?
+  `, [req.params.id]);
   if (!review) return res.status(404).json({ error: 'Review not found.' });
 
   const existing = await getDb('SELECT id FROM review_likes WHERE review_id = ? AND user_id = ?', [req.params.id, req.user.id]);
@@ -1055,7 +1719,18 @@ app.post('/api/reviews/:id/like', requireAuth, async (req, res) => {
     return res.json({ liked: false });
   }
 
-  await runDb('INSERT INTO review_likes (review_id, user_id) VALUES (?, ?)', [req.params.id, req.user.id]);
+  const result = await runDb('INSERT INTO review_likes (review_id, user_id) VALUES (?, ?)', [req.params.id, req.user.id]);
+  if (result.changes && Number(review.user_id) !== Number(req.user.id)) {
+    const actor = await getDb('SELECT username, full_name FROM users WHERE id = ?', [req.user.id]);
+    const actorName = actor.full_name || actor.username;
+    await createNotification(
+      review.user_id,
+      'REVIEW_LIKE',
+      `${actorName} curtiu sua resenha de ${review.release_title}.`,
+      `/releases/${review.release_id}`,
+      req.user.id
+    );
+  }
   return res.json({ liked: true });
 });
 
@@ -1079,39 +1754,198 @@ app.post('/api/pre-saves/:releaseId', requireAuth, async (req, res) => {
 });
 
 app.get('/api/notifications', requireAuth, async (req, res) => {
-  const notifications = await allDb('SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC', [req.user.id]);
-  return res.json(notifications);
+  const [notifications, unreadCount] = await Promise.all([
+    allDb(`
+      SELECT n.id, n.type, n.actor_user_id, n.message, n.link_url, n.read_status, n.created_at,
+        u.username AS actor_username, u.full_name AS actor_full_name, u.avatar_url AS actor_avatar_url
+      FROM notifications n
+      LEFT JOIN users u ON u.id = n.actor_user_id
+      WHERE n.user_id = ?
+      ORDER BY n.created_at DESC, n.id DESC
+      LIMIT 50
+    `, [req.user.id]),
+    getDb('SELECT COUNT(*) AS count FROM notifications WHERE user_id = ? AND read_status = 0', [req.user.id]),
+  ]);
+  return res.json({
+    notifications,
+    unread_count: Number(unreadCount.count || 0),
+    account_suspended: Boolean(req.user.is_suspended),
+  });
 });
 
 app.post('/api/notifications/:id/read', requireAuth, async (req, res) => {
-  await runDb('UPDATE notifications SET read_status = 1 WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
+  const notificationId = parsePositiveId(req.params.id);
+  if (!notificationId) return res.status(400).json({ error: 'Invalid notification ID.' });
+  const result = await runDb(
+    'UPDATE notifications SET read_status = 1 WHERE id = ? AND user_id = ?',
+    [notificationId, req.user.id]
+  );
+  if (!result.changes) {
+    const notification = await getDb('SELECT id FROM notifications WHERE id = ? AND user_id = ?', [notificationId, req.user.id]);
+    if (!notification) return res.status(404).json({ error: 'Notification not found.' });
+  }
   return res.json({ message: 'Notification marked as read.' });
 });
 
-app.get('/api/profile/:userId', async (req, res) => {
-  const user = await getDb('SELECT * FROM users WHERE id = ?', [req.params.userId]);
-  if (!user) return res.status(404).json({ error: 'User not found.' });
+app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
+  await runDb('UPDATE notifications SET read_status = 1 WHERE user_id = ? AND read_status = 0', [req.user.id]);
+  return res.json({ message: 'All notifications marked as read.' });
+});
+
+app.get('/api/users', requireAuth, async (req, res) => {
+  const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  if (query.length > 100) return res.status(400).json({ error: 'A busca deve ter no máximo 100 caracteres.' });
+  if (query.length === 1) return res.status(400).json({ error: 'Digite pelo menos 2 caracteres para buscar pessoas.' });
+
+  const pattern = `%${query}%`;
+  const users = await allDb(`
+    SELECT u.id, u.username, u.full_name, u.avatar_url, u.bio,
+      (SELECT COUNT(*) FROM user_follows f WHERE f.followed_id = u.id) AS follower_count,
+      EXISTS (
+        SELECT 1 FROM user_follows f WHERE f.follower_id = ? AND f.followed_id = u.id
+      ) AS followed_by_user
+    FROM users u
+    WHERE u.id <> ?
+      AND u.is_suspended = 0
+      AND u.is_approved = 1
+      AND (? = '' OR u.username LIKE ? OR u.full_name LIKE ?)
+    ORDER BY u.created_at DESC, u.id DESC
+    LIMIT 30
+  `, [req.user.id, req.user.id, query, pattern, pattern]);
+
+  return res.json(users);
+});
+
+app.post('/api/users/:userId/follow', requireAuth, async (req, res) => {
+  const userId = parsePositiveId(req.params.userId);
+  if (!userId) return res.status(400).json({ error: 'Invalid user ID.' });
+  if (userId === Number(req.user.id)) return res.status(400).json({ error: 'You cannot follow your own profile.' });
+
+  const targetUser = await getDb('SELECT id FROM users WHERE id = ? AND is_suspended = 0 AND is_approved = 1', [userId]);
+  if (!targetUser) return res.status(404).json({ error: 'User not found.' });
+
+  const result = await runDb('INSERT IGNORE INTO user_follows (follower_id, followed_id) VALUES (?, ?)', [req.user.id, userId]);
+  if (result.changes) {
+    const actor = await getDb('SELECT username, full_name FROM users WHERE id = ?', [req.user.id]);
+    const actorName = actor.full_name || actor.username;
+    await createNotification(
+      userId,
+      'USER_FOLLOW',
+      `${actorName} começou a seguir você.`,
+      `/profile/${req.user.id}`,
+      req.user.id
+    );
+  }
+  return res.json({ following: true });
+});
+
+app.delete('/api/users/:userId/follow', requireAuth, async (req, res) => {
+  const userId = parsePositiveId(req.params.userId);
+  if (!userId) return res.status(400).json({ error: 'Invalid user ID.' });
+  if (userId === Number(req.user.id)) return res.status(400).json({ error: 'You cannot unfollow your own profile.' });
+
+  const targetUser = await getDb('SELECT id FROM users WHERE id = ? AND is_suspended = 0 AND is_approved = 1', [userId]);
+  if (!targetUser) return res.status(404).json({ error: 'User not found.' });
+  await runDb('DELETE FROM user_follows WHERE follower_id = ? AND followed_id = ?', [req.user.id, userId]);
+  return res.json({ following: false });
+});
+
+const getUserRelationshipList = async (req, res, relationship) => {
+  const userId = parsePositiveId(req.params.userId);
+  if (!userId) return res.status(400).json({ error: 'Invalid user ID.' });
+  const profileUser = await getDb(
+    'SELECT id, is_approved FROM users WHERE id = ? AND is_suspended = 0',
+    [userId]
+  );
+  const canViewPendingProfile = (
+    Number(req.user?.id) === userId
+    || req.user?.role === 'ADMIN'
+  );
+  if (!profileUser || (!Number(profileUser.is_approved) && !canViewPendingProfile)) {
+    return res.status(404).json({ error: 'User not found.' });
+  }
+
+  const followerColumn = relationship === 'followers' ? 'uf.followed_id' : 'uf.follower_id';
+  const selectedColumn = relationship === 'followers' ? 'uf.follower_id' : 'uf.followed_id';
+  const users = await allDb(`
+    SELECT u.id, u.username, u.full_name, u.avatar_url, u.bio,
+      (SELECT COUNT(*) FROM user_follows f WHERE f.followed_id = u.id) AS follower_count,
+      EXISTS (
+        SELECT 1 FROM user_follows f WHERE f.follower_id = ? AND f.followed_id = u.id
+      ) AS followed_by_user
+    FROM user_follows uf
+    JOIN users u ON u.id = ${selectedColumn}
+    WHERE ${followerColumn} = ?
+      AND u.is_suspended = 0
+      AND u.is_approved = 1
+    ORDER BY uf.created_at DESC
+    LIMIT 100
+  `, [req.user?.id || 0, userId]);
+  return res.json(users);
+};
+
+app.get('/api/users/:userId/followers', optionalAuth, (req, res) => getUserRelationshipList(req, res, 'followers'));
+app.get('/api/users/:userId/following', optionalAuth, (req, res) => getUserRelationshipList(req, res, 'following'));
+
+app.get('/api/profile/:userId', optionalAuth, async (req, res) => {
+  const userId = parsePositiveId(req.params.userId);
+  if (!userId) return res.status(400).json({ error: 'Invalid user ID.' });
+  const user = await getDb(
+    'SELECT id, username, full_name, avatar_url, banner_url, bio, created_at, is_approved FROM users WHERE id = ? AND is_suspended = 0',
+    [userId]
+  );
+  const canViewPendingProfile = (
+    Number(req.user?.id) === userId
+    || req.user?.role === 'ADMIN'
+  );
+  if (!user || (!Number(user.is_approved) && !canViewPendingProfile)) {
+    return res.status(404).json({ error: 'User not found.' });
+  }
 
   const reviews = await allDb(`
-    SELECT rv.*, r.title AS release_title, r.cover_url AS release_cover, a.name AS artist_name
+    SELECT rv.*, rm.gif_url, r.title AS release_title, r.cover_url AS release_cover, a.name AS artist_name,
+      (SELECT COUNT(*) FROM review_likes rl WHERE rl.review_id = rv.id) AS like_count,
+      EXISTS (
+        SELECT 1 FROM review_likes rl WHERE rl.review_id = rv.id AND rl.user_id = ?
+      ) AS liked_by_user
     FROM reviews rv
+    LEFT JOIN review_media rm ON rm.review_id = rv.id
     JOIN releases r ON r.id = rv.release_id
     JOIN artists a ON a.id = r.artist_id
     WHERE rv.user_id = ?
     ORDER BY rv.created_at DESC
-  `, [req.params.userId]);
+  `, [req.user?.id || 0, userId]);
 
-  const playlists = await allDb('SELECT * FROM playlists WHERE user_id = ? ORDER BY created_at DESC', [req.params.userId]);
+  const playlists = await allDb(`
+    SELECT p.*, (
+      SELECT COUNT(*)
+      FROM playlist_tracks pt
+      WHERE pt.playlist_id = p.id
+    ) AS track_count
+    FROM playlists p
+    WHERE p.user_id = ?
+    ORDER BY p.created_at DESC
+  `, [userId]);
   const favorites = await allDb(`
-    SELECT f.*, t.title AS track_title, r.title AS release_title, a.name AS artist_name
+    SELECT f.*, t.title AS track_title, r.id AS release_id, r.title AS release_title,
+      r.cover_url AS release_cover, a.name AS artist_name
     FROM favorites f
     JOIN tracks t ON t.id = f.track_id
     JOIN releases r ON r.id = t.release_id
     JOIN artists a ON a.id = r.artist_id
     WHERE f.user_id = ?
-  `, [req.params.userId]);
+    ORDER BY f.created_at DESC
+  `, [userId]);
+  const social = await getDb(`
+    SELECT
+      (SELECT COUNT(*) FROM user_follows WHERE followed_id = ?) AS followers,
+      (SELECT COUNT(*) FROM user_follows WHERE follower_id = ?) AS following,
+      EXISTS (
+        SELECT 1 FROM user_follows WHERE follower_id = ? AND followed_id = ?
+      ) AS is_following
+  `, [userId, userId, req.user?.id || 0, userId]);
 
-  return res.json({ user: normalizeUser(user), reviews, playlists, favorites });
+  return res.json({ user: normalizePublicUser(user), reviews, playlists, favorites, social });
 });
 
 app.put('/api/users/me', requireAuth, async (req, res) => {
@@ -1128,7 +1962,7 @@ app.put('/api/users/me', requireAuth, async (req, res) => {
   return res.json({ user: normalizeUser(user) });
 });
 
-app.get('/api/explore', async (req, res) => {
+app.get('/api/explore', optionalAuth, async (req, res) => {
   const featured = await allDb(`
     SELECT fr.sort_order, r.*, a.name as artist_name
     FROM featured_releases fr
@@ -1145,6 +1979,21 @@ app.get('/api/explore', async (req, res) => {
     LIMIT 6
   `);
 
+  const releases = await allDb(`
+    SELECT r.*, a.name AS artist_name, a.image_url AS artist_image,
+      rv.avg_rating, COALESCE(rv.review_count, 0) AS review_count
+    FROM releases r
+    JOIN artists a ON a.id = r.artist_id
+    LEFT JOIN (
+      SELECT rv.release_id, ROUND(AVG(rv.rating), 1) AS avg_rating, COUNT(*) AS review_count
+      FROM reviews rv
+      JOIN users u ON u.id = rv.user_id
+      WHERE u.is_suspended = 0
+      GROUP BY rv.release_id
+    ) rv ON rv.release_id = r.id
+    ORDER BY r.release_date DESC, r.id DESC
+  `);
+
   const artists = await allDb(`
     SELECT a.*,
       (SELECT COUNT(*) FROM releases r WHERE r.artist_id = a.id) AS release_count
@@ -1154,16 +2003,123 @@ app.get('/api/explore', async (req, res) => {
   `);
 
   const reviews = await allDb(`
-    SELECT rv.*, u.username, u.avatar_url, r.title AS release_title, a.name AS artist_name, r.cover_url AS cover_url 
+    SELECT rv.*, rm.gif_url, u.username, u.full_name, u.avatar_url,
+      r.title AS release_title, r.cover_url AS cover_url, a.name AS artist_name,
+      (SELECT COUNT(*) FROM review_likes rl WHERE rl.review_id = rv.id) AS like_count,
+      EXISTS (
+        SELECT 1 FROM review_likes rl WHERE rl.review_id = rv.id AND rl.user_id = ?
+      ) AS liked_by_user
     FROM reviews rv
+    LEFT JOIN review_media rm ON rm.review_id = rv.id
     JOIN users u ON u.id = rv.user_id
     JOIN releases r ON r.id = rv.release_id
     JOIN artists a ON a.id = r.artist_id
+    WHERE u.is_suspended = 0
     ORDER BY rv.created_at DESC
     LIMIT 6
+  `, [req.user?.id || 0]);
+
+  return res.json({
+    featured: await attachReleaseArtists(featured),
+    recent: await attachReleaseArtists(recent),
+    releases: await attachReleaseArtists(releases),
+    artists,
+    reviews,
+  });
+});
+
+app.get('/api/home-feed', optionalAuth, async (req, res) => {
+  const featuredSlides = await allDb(`
+    SELECT fr.id, fr.release_id,
+      COALESCE(NULLIF(fr.banner_url, ''), r.cover_url, '') AS banner_url,
+      COALESCE(fr.description, '') AS description, fr.sort_order,
+      r.title, r.cover_url, r.release_type, a.name AS artist_name
+    FROM featured_releases fr
+    JOIN releases r ON r.id = fr.release_id
+    JOIN artists a ON a.id = r.artist_id
+    ORDER BY fr.sort_order ASC, fr.id ASC
   `);
 
-  return res.json({ featured, recent, artists, reviews });
+  const recentReleases = await allDb(`
+    SELECT r.*, a.name AS artist_name
+    FROM releases r
+    JOIN artists a ON a.id = r.artist_id
+    WHERE r.status = 'ACTIVE'
+      AND r.release_date BETWEEN DATE_SUB(CURDATE(), INTERVAL 2 MONTH) AND CURDATE()
+    ORDER BY r.release_date DESC, r.id DESC
+    LIMIT 12
+  `);
+
+  const personalizedFilter = req.user ? `
+    WHERE u.is_suspended = 0 AND (
+      rv.user_id = ?
+      OR EXISTS (
+        SELECT 1 FROM user_follows uf
+        WHERE uf.follower_id = ? AND uf.followed_id = rv.user_id
+      )
+      OR EXISTS (
+        SELECT 1 FROM pre_saves ps
+        WHERE ps.user_id = ? AND ps.release_id = rv.release_id
+      )
+      OR EXISTS (
+        SELECT 1 FROM favorites f
+        JOIN tracks t ON t.id = f.track_id
+        WHERE f.user_id = ? AND t.release_id = rv.release_id
+      )
+    )
+  ` : 'WHERE u.is_suspended = 0';
+  const feedParams = req.user
+    ? [req.user.id, req.user.id, req.user.id, req.user.id, req.user.id]
+    : [0];
+  const reviews = await allDb(`
+    SELECT rv.*, rm.gif_url, u.username, u.full_name, u.avatar_url,
+      r.title AS release_title, r.cover_url AS release_cover, a.name AS artist_name,
+      (SELECT COUNT(*) FROM review_likes rl WHERE rl.review_id = rv.id) AS like_count,
+      EXISTS (
+        SELECT 1 FROM review_likes rl WHERE rl.review_id = rv.id AND rl.user_id = ?
+      ) AS liked_by_user
+    FROM reviews rv
+    LEFT JOIN review_media rm ON rm.review_id = rv.id
+    JOIN users u ON u.id = rv.user_id
+    JOIN releases r ON r.id = rv.release_id
+    JOIN artists a ON a.id = r.artist_id
+    ${personalizedFilter}
+    ORDER BY rv.created_at DESC
+    LIMIT 50
+  `, feedParams);
+
+  let followingReviews = [];
+  let generalReviews = reviews;
+  if (req.user) {
+    followingReviews = await allDb(`
+      SELECT rv.*, rm.gif_url, u.username, u.full_name, u.avatar_url,
+        r.title AS release_title, r.cover_url AS release_cover, a.name AS artist_name,
+        (SELECT COUNT(*) FROM review_likes rl WHERE rl.review_id = rv.id) AS like_count,
+        EXISTS (
+          SELECT 1 FROM review_likes rl WHERE rl.review_id = rv.id AND rl.user_id = ?
+        ) AS liked_by_user
+      FROM reviews rv
+      LEFT JOIN review_media rm ON rm.review_id = rv.id
+      JOIN users u ON u.id = rv.user_id
+      JOIN releases r ON r.id = rv.release_id
+      JOIN artists a ON a.id = r.artist_id
+      WHERE u.is_suspended = 0
+        AND EXISTS (
+          SELECT 1 FROM user_follows uf
+          WHERE uf.follower_id = ? AND uf.followed_id = rv.user_id
+        )
+      ORDER BY rv.created_at DESC
+      LIMIT 50
+    `, [req.user.id, req.user.id]);
+  }
+
+  return res.json({
+    featured_slides: await attachReleaseArtists(featuredSlides),
+    recent_releases: await attachReleaseArtists(recentReleases),
+    following_reviews: followingReviews,
+    general_reviews: generalReviews,
+    reviews: followingReviews.length ? followingReviews : generalReviews,
+  });
 });
 
 app.get('/api/genres', async (req, res) => {
@@ -1171,36 +2127,193 @@ app.get('/api/genres', async (req, res) => {
   return res.json(genres);
 });
 
+app.post('/api/genres', requireAuth, requireAdmin, async (req, res) => {
+  const name = typeof req.body?.name === 'string'
+    ? req.body.name.trim().replace(/\s+/g, ' ')
+    : '';
+  if (!name) return res.status(400).json({ error: 'Genre name is required.' });
+  if (name.length > 191) return res.status(400).json({ error: 'Genre name must be 191 characters or fewer.' });
+
+  await runDb('INSERT IGNORE INTO genres (name) VALUES (?)', [name]);
+  const genre = await getDb('SELECT id, name FROM genres WHERE name = ?', [name]);
+  if (!genre) return res.status(500).json({ error: 'Could not create genre.' });
+  return res.status(201).json(genre);
+});
+
 app.get('/api/playlists', requireAuth, async (req, res) => {
-  const playlists = await allDb('SELECT * FROM playlists WHERE user_id = ? ORDER BY created_at DESC', [req.user.id]);
+  const playlists = await allDb(`
+    SELECT p.*,
+      (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) AS track_count
+    FROM playlists p
+    WHERE p.user_id = ?
+    ORDER BY p.created_at DESC, p.id DESC
+  `, [req.user.id]);
   return res.json(playlists);
+});
+
+app.get('/api/playlists/:playlistId', async (req, res) => {
+  const playlistId = parsePositiveId(req.params.playlistId);
+  if (!playlistId) return res.status(400).json({ error: 'Invalid playlist ID.' });
+
+  const playlist = await getDb(`
+    SELECT p.*, u.username, u.full_name, u.avatar_url,
+      (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) AS track_count
+    FROM playlists p
+    JOIN users u ON u.id = p.user_id
+    WHERE p.id = ? AND u.is_suspended = 0
+  `, [playlistId]);
+  if (!playlist) return res.status(404).json({ error: 'Playlist not found.' });
+
+  const tracks = await allDb(`
+    SELECT pt.track_id, pt.sort_order, t.title AS track_title, t.duration, t.explicit,
+      t.youtube_url, r.id AS release_id, r.title AS release_title, r.cover_url AS release_cover,
+      a.name AS artist_name
+    FROM playlist_tracks pt
+    JOIN tracks t ON t.id = pt.track_id
+    JOIN releases r ON r.id = t.release_id
+    JOIN artists a ON a.id = r.artist_id
+    WHERE pt.playlist_id = ?
+    ORDER BY pt.sort_order ASC, pt.id ASC
+  `, [playlistId]);
+
+  return res.json({ playlist, tracks });
 });
 
 app.post('/api/playlists', requireAuth, async (req, res) => {
   const { name, description, cover_url } = req.body;
-  if (!name) return res.status(400).json({ error: 'Playlist name is required.' });
+  const playlistName = typeof name === 'string' ? name.trim() : '';
+  const playlistDescription = typeof description === 'string' ? description.trim() : '';
+  const playlistCover = typeof cover_url === 'string' ? cover_url.trim() : '';
+  if (!playlistName) return res.status(400).json({ error: 'Playlist name is required.' });
+  if (playlistName.length > 191 || playlistDescription.length > 2000 || !isValidImageUrl(playlistCover)) {
+    return res.status(400).json({ error: 'Playlist details are invalid or too long.' });
+  }
 
   const playlist = await runDb(
     `INSERT INTO playlists (user_id, name, description, cover_url) VALUES (?, ?, ?, ?)`,
-    [req.user.id, name, description || '', cover_url || '']
+    [req.user.id, playlistName, playlistDescription, playlistCover]
   );
   return res.status(201).json({ message: 'Playlist created.', playlistId: playlist.id });
 });
 
-app.post('/api/playlists/:playlistId/tracks', requireAuth, async (req, res) => {
-  const { track_id } = req.body;
-  if (!track_id) return res.status(400).json({ error: 'Track is required.' });
-
-  const playlist = await getDb('SELECT id FROM playlists WHERE id = ? AND user_id = ?', [req.params.playlistId, req.user.id]);
-  if (!playlist) return res.status(404).json({ error: 'Playlist not found.' });
-
-  const existingTrack = await getDb('SELECT id FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?', [req.params.playlistId, track_id]);
-  if (existingTrack) {
-    return res.json({ added: false });
+app.put('/api/playlists/:playlistId', requireAuth, async (req, res) => {
+  const playlistId = parsePositiveId(req.params.playlistId);
+  if (!playlistId) return res.status(400).json({ error: 'Invalid playlist ID.' });
+  const { name, description, cover_url } = req.body;
+  const playlistName = typeof name === 'string' ? name.trim() : '';
+  const playlistDescription = typeof description === 'string' ? description.trim() : '';
+  const playlistCover = typeof cover_url === 'string' ? cover_url.trim() : '';
+  if (!playlistName) return res.status(400).json({ error: 'Playlist name is required.' });
+  if (playlistName.length > 191 || playlistDescription.length > 2000 || !isValidImageUrl(playlistCover)) {
+    return res.status(400).json({ error: 'Playlist details are invalid or too long.' });
   }
 
-  await runDb('INSERT INTO playlist_tracks (playlist_id, track_id) VALUES (?, ?)', [req.params.playlistId, track_id]);
-  return res.status(201).json({ added: true });
+  const result = await runDb(
+    'UPDATE playlists SET name = ?, description = ?, cover_url = ? WHERE id = ? AND user_id = ?',
+    [playlistName, playlistDescription, playlistCover, playlistId, req.user.id]
+  );
+  if (!result.changes) {
+    const playlist = await getDb('SELECT id FROM playlists WHERE id = ? AND user_id = ?', [playlistId, req.user.id]);
+    if (!playlist) return res.status(404).json({ error: 'Playlist not found.' });
+  }
+  return res.json({ message: 'Playlist updated.' });
+});
+
+app.delete('/api/playlists/:playlistId', requireAuth, async (req, res) => {
+  const playlistId = parsePositiveId(req.params.playlistId);
+  if (!playlistId) return res.status(400).json({ error: 'Invalid playlist ID.' });
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [playlists] = await connection.execute(
+      'SELECT id FROM playlists WHERE id = ? AND user_id = ? FOR UPDATE',
+      [playlistId, req.user.id]
+    );
+    if (!playlists.length) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Playlist not found.' });
+    }
+    await connection.execute('DELETE FROM playlist_tracks WHERE playlist_id = ?', [playlistId]);
+    await connection.execute('DELETE FROM playlists WHERE id = ? AND user_id = ?', [playlistId, req.user.id]);
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+  return res.json({ message: 'Playlist deleted.' });
+});
+
+app.post('/api/playlists/:playlistId/tracks', requireAuth, async (req, res) => {
+  const playlistId = parsePositiveId(req.params.playlistId);
+  const trackId = parsePositiveId(req.body.track_id);
+  if (!playlistId) return res.status(400).json({ error: 'Invalid playlist ID.' });
+  if (!trackId) return res.status(400).json({ error: 'Track is required.' });
+
+  const playlist = await getDb('SELECT id FROM playlists WHERE id = ? AND user_id = ?', [playlistId, req.user.id]);
+  if (!playlist) return res.status(404).json({ error: 'Playlist not found.' });
+  const track = await getDb('SELECT id FROM tracks WHERE id = ?', [trackId]);
+  if (!track) return res.status(404).json({ error: 'Track not found.' });
+
+  const sortRow = await getDb('SELECT COALESCE(MAX(sort_order) + 1, 0) AS next_order FROM playlist_tracks WHERE playlist_id = ?', [playlistId]);
+  const result = await runDb(
+    'INSERT IGNORE INTO playlist_tracks (playlist_id, track_id, sort_order) VALUES (?, ?, ?)',
+    [playlistId, trackId, Number(sortRow.next_order)]
+  );
+  return res.status(result.changes ? 201 : 200).json({ added: Boolean(result.changes) });
+});
+
+app.delete('/api/playlists/:playlistId/tracks/:trackId', requireAuth, async (req, res) => {
+  const playlistId = parsePositiveId(req.params.playlistId);
+  const trackId = parsePositiveId(req.params.trackId);
+  if (!playlistId || !trackId) return res.status(400).json({ error: 'Invalid playlist or track ID.' });
+
+  const playlist = await getDb('SELECT id FROM playlists WHERE id = ? AND user_id = ?', [playlistId, req.user.id]);
+  if (!playlist) return res.status(404).json({ error: 'Playlist not found.' });
+  const result = await runDb('DELETE FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?', [playlistId, trackId]);
+  if (!result.changes) return res.status(404).json({ error: 'Track not found in this playlist.' });
+  return res.json({ message: 'Track removed from playlist.' });
+});
+
+app.put('/api/playlists/:playlistId/tracks/order', requireAuth, async (req, res) => {
+  const playlistId = parsePositiveId(req.params.playlistId);
+  const trackIds = req.body.track_ids;
+  if (!playlistId) return res.status(400).json({ error: 'Invalid playlist ID.' });
+  if (!Array.isArray(trackIds) || trackIds.some((id) => !parsePositiveId(id))) {
+    return res.status(400).json({ error: 'Track order is invalid.' });
+  }
+
+  const playlist = await getDb('SELECT id FROM playlists WHERE id = ? AND user_id = ?', [playlistId, req.user.id]);
+  if (!playlist) return res.status(404).json({ error: 'Playlist not found.' });
+  const existingTracks = await allDb('SELECT track_id FROM playlist_tracks WHERE playlist_id = ?', [playlistId]);
+  const currentIds = existingTracks.map((row) => Number(row.track_id));
+  const requestedIds = trackIds.map(Number);
+  if (
+    requestedIds.length !== currentIds.length
+    || new Set(requestedIds).size !== requestedIds.length
+    || currentIds.some((id) => !requestedIds.includes(id))
+  ) {
+    return res.status(400).json({ error: 'Track order must include every playlist track exactly once.' });
+  }
+
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    for (const [index, trackId] of requestedIds.entries()) {
+      await connection.execute(
+        'UPDATE playlist_tracks SET sort_order = ? WHERE playlist_id = ? AND track_id = ?',
+        [index, playlistId, trackId]
+      );
+    }
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+  return res.json({ message: 'Playlist order updated.' });
 });
 
 app.post('/api/favorites/:trackId', requireAuth, async (req, res) => {
@@ -1239,28 +2352,319 @@ app.post('/api/admin/reset-catalog', requireAuth, requireAdmin, resetCatalogHand
 app.post('/api/admin/reset', requireAuth, requireAdmin, resetCatalogHandler);
 app.post('/api/admin/catalog/reset', requireAuth, requireAdmin, resetCatalogHandler);
 
-app.post('/api/admin/featured', requireAuth, requireAdmin, async (req, res) => {
-  const { release_id, sort_order } = req.body;
+app.get('/api/admin/featured', requireAuth, requireAdmin, async (req, res) => {
+  const featured = await allDb(`
+    SELECT fr.id, fr.release_id, fr.sort_order, fr.banner_url, fr.description,
+      r.title, r.cover_url, r.status, a.name AS artist_name
+    FROM featured_releases fr
+    JOIN releases r ON r.id = fr.release_id
+    JOIN artists a ON a.id = r.artist_id
+    ORDER BY fr.sort_order ASC, fr.id ASC
+  `);
+  return res.json(featured);
+});
 
-  if (!release_id) {
+app.post('/api/admin/featured', requireAuth, requireAdmin, async (req, res) => {
+  const { release_id, sort_order, banner_url, description } = req.body;
+  const releaseId = Number(release_id);
+  const order = Number(sort_order);
+  const bannerUrl = typeof banner_url === 'string' ? banner_url.trim() : '';
+  const featuredDescription = typeof description === 'string' ? description.trim() : '';
+
+  if (!Number.isSafeInteger(releaseId) || releaseId < 1) {
     return res.status(400).json({ error: 'Selecione um lançamento para destacar.' });
   }
+  if (!bannerUrl || !isValidImageUrl(bannerUrl)) {
+    return res.status(400).json({ error: 'Escolha ou carregue um banner válido para o destaque.' });
+  }
+  if (!featuredDescription || featuredDescription.length > 600) {
+    return res.status(400).json({ error: 'Escreva uma descrição de até 600 caracteres para o destaque.' });
+  }
+  if (!Number.isSafeInteger(order) || order < 1) {
+    return res.status(400).json({ error: 'A ordem do destaque deve ser um número inteiro positivo.' });
+  }
 
-  const release = await getDb('SELECT id FROM releases WHERE id = ?', [release_id]);
+  const release = await getDb('SELECT id FROM releases WHERE id = ?', [releaseId]);
   if (!release) {
     return res.status(404).json({ error: 'Lançamento não encontrado.' });
   }
 
-  const order = Number(sort_order || 1);
-  const existing = await getDb('SELECT id FROM featured_releases WHERE release_id = ?', [release_id]);
+  const existing = await getDb('SELECT id FROM featured_releases WHERE release_id = ?', [releaseId]);
 
   if (existing) {
-    await runDb('UPDATE featured_releases SET sort_order = ? WHERE id = ?', [order, existing.id]);
+    await runDb(
+      'UPDATE featured_releases SET sort_order = ?, banner_url = ?, description = ? WHERE id = ?',
+      [order, bannerUrl, featuredDescription, existing.id]
+    );
     return res.json({ message: 'Destaque atualizado.' });
   }
 
-  await runDb('INSERT INTO featured_releases (release_id, sort_order) VALUES (?, ?)', [release_id, order]);
+  await runDb(
+    'INSERT INTO featured_releases (release_id, sort_order, banner_url, description) VALUES (?, ?, ?, ?)',
+    [releaseId, order, bannerUrl, featuredDescription]
+  );
   return res.status(201).json({ message: 'Destaque criado.' });
+});
+
+app.delete('/api/admin/featured/:featuredId', requireAuth, requireAdmin, async (req, res) => {
+  const featuredId = Number(req.params.featuredId);
+  if (!Number.isSafeInteger(featuredId) || featuredId < 1) {
+    return res.status(400).json({ error: 'Destaque inválido.' });
+  }
+
+  const featured = await getDb('SELECT id FROM featured_releases WHERE id = ?', [featuredId]);
+  if (!featured) {
+    return res.status(404).json({ error: 'Destaque não encontrado.' });
+  }
+
+  await runDb('DELETE FROM featured_releases WHERE id = ?', [featuredId]);
+  return res.json({ message: 'Destaque removido do carrossel.' });
+});
+
+app.get('/api/admin/settings/profile-approval', requireAuth, requireAdmin, async (req, res) => {
+  const setting = await getDb(
+    'SELECT setting_value FROM app_settings WHERE setting_key = ?',
+    ['require_profile_approval']
+  );
+  if (!setting) {
+    return res.status(503).json({ error: 'Registration settings are unavailable.' });
+  }
+  return res.json({ enabled: setting.setting_value === '1' });
+});
+
+app.put('/api/admin/settings/profile-approval', requireAuth, requireAdmin, async (req, res) => {
+  if (typeof req.body?.enabled !== 'boolean') {
+    return res.status(400).json({ error: 'Informe se a aprovação de perfis deve ficar ativada.' });
+  }
+
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [settingRows] = await connection.execute(
+      'SELECT setting_value FROM app_settings WHERE setting_key = ? FOR UPDATE',
+      ['require_profile_approval']
+    );
+    if (!settingRows[0]) {
+      await connection.rollback();
+      return res.status(503).json({ error: 'Registration settings are unavailable.' });
+    }
+
+    await connection.execute(
+      `UPDATE app_settings SET setting_value = ?, updated_at = CURRENT_TIMESTAMP WHERE setting_key = ?`,
+      [req.body.enabled ? '1' : '0', 'require_profile_approval']
+    );
+
+    let approvedCount = 0;
+    if (!req.body.enabled) {
+      await connection.execute(`
+        INSERT INTO notifications (user_id, type, actor_user_id, message, link_url)
+        SELECT id, 'ACCOUNT_APPROVED', ?, ?, '/'
+        FROM users
+        WHERE \`role\` = 'USER' AND is_approved = 0
+      `, [
+        req.user.id,
+        'A aprovação manual de perfis foi desativada. Sua conta foi liberada para participar do Musicfy.',
+      ]);
+      const [result] = await connection.execute(
+        `UPDATE users SET is_approved = 1, updated_at = CURRENT_TIMESTAMP WHERE \`role\` = 'USER' AND is_approved = 0`
+      );
+      approvedCount = Number(result.affectedRows || 0);
+    }
+
+    await connection.commit();
+    return res.json({ enabled: req.body.enabled, approved_count: approvedCount });
+  } catch (error) {
+    try {
+      await connection.rollback();
+    } catch (rollbackError) {
+      console.error('Failed to roll back profile approval settings:', rollbackError);
+    }
+    throw error;
+  } finally {
+    connection.release();
+  }
+});
+
+app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
+  const approvalFilter = req.query.approval === 'pending' ? 'AND is_approved = 0' : '';
+  const users = await allDb(`
+    SELECT id, username, full_name, email, avatar_url, bio, is_suspended, is_approved, created_at
+    FROM users
+    WHERE \`role\` = 'USER'
+      ${approvalFilter}
+    ORDER BY is_approved ASC, is_suspended ASC, created_at DESC, id DESC
+    LIMIT 200
+  `);
+  return res.json(users.map((user) => ({
+    ...user,
+    is_suspended: Boolean(Number(user.is_suspended)),
+    is_approved: Boolean(Number(user.is_approved)),
+  })));
+});
+
+app.post('/api/admin/users/:userId/approve', requireAuth, requireAdmin, async (req, res) => {
+  const userId = parsePositiveId(req.params.userId);
+  if (!userId) return res.status(400).json({ error: 'User ID is invalid.' });
+
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.execute(
+      'SELECT id, `role`, is_approved FROM users WHERE id = ? FOR UPDATE',
+      [userId]
+    );
+    const target = rows[0];
+    if (!target) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    if (target.role !== 'USER') {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Only standard user profiles can be approved.' });
+    }
+    if (Number(target.is_approved)) {
+      await connection.rollback();
+      return res.json({ is_approved: true, changed: false });
+    }
+
+    await connection.execute(
+      'UPDATE users SET is_approved = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      [userId]
+    );
+    await connection.execute(
+      'INSERT INTO notifications (user_id, type, actor_user_id, message, link_url) VALUES (?, ?, ?, ?, ?)',
+      [
+        userId,
+        'ACCOUNT_APPROVED',
+        req.user.id,
+        'Sua conta foi aprovada. Atualize a página para começar a participar do Musicfy.',
+        '/',
+      ]
+    );
+    await connection.commit();
+    return res.json({ is_approved: true, changed: true });
+  } catch (error) {
+    try {
+      await connection.rollback();
+    } catch (rollbackError) {
+      console.error('Failed to roll back profile approval:', rollbackError);
+    }
+    throw error;
+  } finally {
+    connection.release();
+  }
+});
+
+app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, res) => {
+  const userId = parsePositiveId(req.params.userId);
+  if (!userId) return res.status(400).json({ error: 'User ID is invalid.' });
+  if (userId === Number(req.user.id)) {
+    return res.status(400).json({ error: 'Administrators cannot suspend their own account.' });
+  }
+
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.execute(
+      'SELECT id, `role`, is_suspended FROM users WHERE id = ? FOR UPDATE',
+      [userId]
+    );
+    const target = rows[0];
+    if (!target) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    if (target.role !== 'USER') {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Only standard user profiles can be suspended.' });
+    }
+    if (Number(target.is_suspended)) {
+      await connection.rollback();
+      return res.json({ is_suspended: true, changed: false });
+    }
+
+    await connection.execute('UPDATE users SET is_suspended = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [userId]);
+    await connection.execute(
+      'INSERT INTO notifications (user_id, type, actor_user_id, message) VALUES (?, ?, ?, ?)',
+      [
+        userId,
+        'ACCOUNT_SUSPENDED',
+        req.user.id,
+        'Seu perfil foi ocultado pela equipe administrativa. Você pode acessar apenas suas notificações.',
+      ]
+    );
+    await connection.commit();
+    return res.json({ is_suspended: true, changed: true });
+  } catch (error) {
+    try {
+      await connection.rollback();
+    } catch (rollbackError) {
+      console.error('Failed to roll back profile suspension:', rollbackError);
+    }
+    throw error;
+  } finally {
+    connection.release();
+  }
+});
+
+app.post('/api/admin/users/:userId/restore', requireAuth, requireAdmin, async (req, res) => {
+  const userId = parsePositiveId(req.params.userId);
+  if (!userId) return res.status(400).json({ error: 'User ID is invalid.' });
+
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.execute(
+      'SELECT id, `role`, is_suspended FROM users WHERE id = ? FOR UPDATE',
+      [userId]
+    );
+    const target = rows[0];
+    if (!target) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    if (target.role !== 'USER') {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Only standard user profiles can be restored.' });
+    }
+    if (!Number(target.is_suspended)) {
+      await connection.rollback();
+      return res.json({ is_suspended: false, changed: false });
+    }
+
+    await connection.execute('UPDATE users SET is_suspended = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [userId]);
+    await connection.execute(
+      'INSERT INTO notifications (user_id, type, actor_user_id, message) VALUES (?, ?, ?, ?)',
+      [userId, 'ACCOUNT_RESTORED', req.user.id, 'Seu perfil foi reativado pela equipe administrativa.']
+    );
+    await connection.commit();
+    return res.json({ is_suspended: false, changed: true });
+  } catch (error) {
+    try {
+      await connection.rollback();
+    } catch (rollbackError) {
+      console.error('Failed to roll back profile restoration:', rollbackError);
+    }
+    throw error;
+  } finally {
+    connection.release();
+  }
+});
+
+app.get('/api/admin/reviews', requireAuth, requireAdmin, async (req, res) => {
+  const reviews = await allDb(`
+    SELECT rv.id, rv.user_id, rv.rating, rv.review_text, rv.created_at,
+      rm.gif_url, u.username, u.full_name, r.title AS release_title,
+      r.cover_url AS release_cover, a.name AS artist_name
+    FROM reviews rv
+    JOIN users u ON u.id = rv.user_id
+    JOIN releases r ON r.id = rv.release_id
+    JOIN artists a ON a.id = r.artist_id
+    LEFT JOIN review_media rm ON rm.review_id = rv.id
+    ORDER BY rv.created_at DESC, rv.id DESC
+    LIMIT 200
+  `);
+  return res.json(reviews);
 });
 
 app.get('/api/dashboard', requireAuth, requireAdmin, async (req, res) => {
@@ -1305,9 +2709,14 @@ app.use((req, res) => {
 
 async function startServer() {
   await initializeDatabase();
+  await publishDueReleases();
   app.listen(PORT, () => {
     console.log(`Musicfy API listening on http://localhost:${PORT}`);
   });
+  const releasePublisher = setInterval(() => {
+    publishDueReleases().catch((error) => console.error('Failed to publish scheduled releases:', error));
+  }, 60000);
+  releasePublisher.unref();
 }
 
 startServer().catch((error) => {

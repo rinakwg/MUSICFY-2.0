@@ -18,11 +18,30 @@ CREATE TABLE IF NOT EXISTS users (
   banner_url VARCHAR(512) NULL,
   bio TEXT NULL,
   `role` VARCHAR(32) NOT NULL DEFAULT 'USER',
+  is_suspended TINYINT(1) NOT NULL DEFAULT 0,
+  is_approved TINYINT(1) NOT NULL DEFAULT 1,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY uq_users_username (username),
   UNIQUE KEY uq_users_email (email)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS app_settings (
+  setting_key VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  setting_value VARCHAR(255) NOT NULL,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (setting_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS user_follows (
+  follower_id BIGINT UNSIGNED NOT NULL,
+  followed_id BIGINT UNSIGNED NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (follower_id, followed_id),
+  KEY idx_user_follows_followed_id (followed_id),
+  CONSTRAINT fk_user_follows_follower FOREIGN KEY (follower_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT fk_user_follows_followed FOREIGN KEY (followed_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS image_assets (
@@ -40,6 +59,7 @@ CREATE TABLE IF NOT EXISTS artists (
   image_url VARCHAR(512) NULL,
   banner_url VARCHAR(512) NULL,
   genre VARCHAR(191) NULL,
+  accent_color VARCHAR(7) NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
@@ -64,11 +84,22 @@ CREATE TABLE IF NOT EXISTS artist_genres (
   CONSTRAINT fk_artist_genres_genre FOREIGN KEY (genre_id) REFERENCES genres(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS artist_follows (
+  user_id BIGINT UNSIGNED NOT NULL,
+  artist_id BIGINT UNSIGNED NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, artist_id),
+  KEY idx_artist_follows_artist_id (artist_id),
+  CONSTRAINT fk_artist_follows_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT fk_artist_follows_artist FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS releases (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   title VARCHAR(191) NOT NULL,
   artist_id BIGINT UNSIGNED NOT NULL,
   cover_url VARCHAR(512) NULL,
+  accent_color VARCHAR(7) NULL,
   release_type VARCHAR(32) NOT NULL,
   release_date DATE NOT NULL,
   genre VARCHAR(191) NULL,
@@ -81,6 +112,16 @@ CREATE TABLE IF NOT EXISTS releases (
   KEY idx_releases_artist_id (artist_id),
   KEY idx_releases_release_date (release_date),
   CONSTRAINT fk_releases_artist FOREIGN KEY (artist_id) REFERENCES artists(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS release_artists (
+  release_id BIGINT UNSIGNED NOT NULL,
+  artist_id BIGINT UNSIGNED NOT NULL,
+  sort_order INT UNSIGNED NOT NULL DEFAULT 0,
+  PRIMARY KEY (release_id, artist_id),
+  KEY idx_release_artists_artist_id (artist_id),
+  CONSTRAINT fk_release_artists_release FOREIGN KEY (release_id) REFERENCES releases(id) ON DELETE CASCADE,
+  CONSTRAINT fk_release_artists_artist FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS tracks (
@@ -167,6 +208,14 @@ CREATE TABLE IF NOT EXISTS reviews (
   CONSTRAINT fk_reviews_release FOREIGN KEY (release_id) REFERENCES releases(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS review_media (
+  review_id BIGINT UNSIGNED NOT NULL,
+  gif_url VARCHAR(512) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (review_id),
+  CONSTRAINT fk_review_media_review FOREIGN KEY (review_id) REFERENCES reviews(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS review_likes (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   review_id BIGINT UNSIGNED NOT NULL,
@@ -195,6 +244,7 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   playlist_id BIGINT UNSIGNED NOT NULL,
   track_id BIGINT UNSIGNED NOT NULL,
+  sort_order INT UNSIGNED NOT NULL DEFAULT 0,
   PRIMARY KEY (id),
   UNIQUE KEY uq_playlist_tracks (playlist_id, track_id),
   KEY idx_playlist_tracks_track_id (track_id),
@@ -229,7 +279,10 @@ CREATE TABLE IF NOT EXISTS pre_saves (
 CREATE TABLE IF NOT EXISTS notifications (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   user_id BIGINT UNSIGNED NOT NULL,
+  type VARCHAR(32) NOT NULL DEFAULT 'GENERAL',
+  actor_user_id BIGINT UNSIGNED NULL,
   message TEXT NOT NULL,
+  link_url VARCHAR(512) NULL,
   read_status TINYINT(1) NOT NULL DEFAULT 0,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
@@ -241,6 +294,8 @@ CREATE TABLE IF NOT EXISTS featured_releases (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   release_id BIGINT UNSIGNED NOT NULL,
   sort_order INT NOT NULL,
+  banner_url VARCHAR(512) NULL,
+  description TEXT NULL,
   PRIMARY KEY (id),
   UNIQUE KEY uq_featured_releases_release (release_id),
   CONSTRAINT fk_featured_releases_release FOREIGN KEY (release_id) REFERENCES releases(id)
